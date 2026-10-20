@@ -1,0 +1,41 @@
+# One-way mirror: GitHub -> Azure Repos (read-only copy for assessment)
+trigger:
+  branches:
+    include: ['*']
+  tags:
+    include: ['*']
+pr: none
+
+# Only needed if "Protect access to repositories in YAML pipelines" is ON
+resources:
+  repositories:
+  - repository: azureMirror
+    type: git
+    name: Pest Monitoring/Pest_Monitoring_App.git
+
+jobs:
+- job: Mirror
+  displayName: Mirror GitHub to Azure Repos
+  pool:
+    vmImage: ubuntu-latest
+  uses:
+    repositories:
+    - azureMirror
+
+  steps:
+  - checkout: self
+    path: github
+    fetchDepth: 0
+    fetchTags: true
+    persistCredentials: false
+
+  - script: |
+      set -e
+      cd "$(Pipeline.Workspace)/github"
+      git update-ref -d refs/remotes/origin/HEAD || true
+      git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags --prune
+      git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
+        push --force --prune \
+        "https://dev.azure.com/FallingCats/Pest%20Monitoring/_git/Pest_Monitoring_App.git" \
+        'refs/remotes/origin/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+    displayName: Push branches and tags to Azure Repos
