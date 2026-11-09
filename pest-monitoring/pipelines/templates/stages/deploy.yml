@@ -1,0 +1,133 @@
+# Reusable release stage (Part 3, Task 2). The pipeline uses it once for "test" and once
+# for "prod", so both environments are deployed by exactly the same steps.
+#
+#   1. Create/update the Azure resources from the ARM template (compiled from infra/main.bicep)
+#   2. Point the backend Web App at the container image built in CI
+#   3. Add env.js to the frontend package and deploy it to the frontend Web App
+#   4. Smoke tests: the deployment fails if the new version isn't answering
+parameters:
+- name: environmentName        # test | prod
+  type: string
+- name: adoEnvironment         # Azure DevOps environment (approvals are set on it)
+  type: string
+- name: dependsOn
+  type: object
+- name: branches               # branches allowed to deploy to this environment
+  type: object
+- name: appServiceSku
+  type: string
+  default: B1
+
+stages:
+- stage: Deploy_${{ parameters.environmentName }}
+  displayName: Deploy to ${{ parameters.environmentName }}
+  dependsOn: ${{ parameters.dependsOn }}
+  condition: >-
+    and(succeeded(),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        containsValue(split('${{ join(',', parameters.branches) }}', ','), variables['Build.SourceBranch']))
+  variables:
+    resourceGroup: rg-pestpatrol-${{ parameters.environmentName }}
+    backendImage: $(acrName).azurecr.io/$(backendImageRepo):$(Build.BuildId)
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy PestPatrol (${{ parameters.environmentName }})
+    environment: ${{ parameters.adoEnvironment }}
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: infra
+            displayName: Download ARM templates
+          - download: current
+            artifact: frontend-package
+            displayName: Download frontend package
+
+          # ---- 1 + 2. Infrastructure as code (also sets the backend image) ----
+          - task: AzureResourceManagerTemplateDeployment@3
+            inputs:
+              deploymentScope: Resource Group
+              azureResourceManagerConnection: $(azureServiceConnection)
+              subscriptionId: $(azureSubscriptionId)
+              action: Create Or Update Resource Group
+              resourceGroupName: $(resourceGroup)
+              location: $(location)
+              templateLocation: Linked artifact
+              csmFile: $(Pipeline.Workspace)/infra/main.json
+              overrideParameters: >-
+                -environmentName ${{ parameters.environmentName }}
+                -acrName $(acrName)
+                -sharedResourceGroup $(sharedResourceGroup)
+                -backendImage $(backendImage)
+                -appVersion $(Build.BuildId)
+                -appServiceSku ${{ parameters.appServiceSku }}
+                -djangoSecretKey $(djangoSecretKey)
+                -demoAdminPassword $(demoAdminPassword)
+              deploymentMode: Incremental
+              deploymentName: pestpatrol-$(Build.BuildId)
+              deploymentOutputs: armOutputs
+            displayName: Deploy ARM template (App Service, Application Insights)
+
+          # Turn the template outputs (app names and URLs) into pipeline variables
+          - bash: |
+              set -euo pipefail
+              for key in backendAppName frontendAppName backendUrl frontendUrl; do
+                value=$(echo "$ARM_OUTPUTS" | jq -r ".${key}.value")
+                echo "$key = $value"
+                echo "##vso[task.setvariable variable=${key}]${value}"
+              done
+            env:
+              ARM_OUTPUTS: $(armOutputs)
+            displayName: Read ARM template outputs
+
+          # ---- 3. Frontend package (zip deploy, the Linux equivalent of a Web Deploy package) ----
+          - bash: |
+              set -euo pipefail
+              WORK="$(Agent.TempDirectory)/web"
+              mkdir -p "$WORK"
+              cp "$(Pipeline.Workspace)/frontend-package/pestpatrol-web.zip" "$WORK/site.zip"
+              # "none" or an undefined variable (left as the literal text "$(name)") means no map key
+              case "$MAPS_KEY" in '$('*|none) MAPS_KEY="" ;; esac
+              cat > "$WORK/env.js" <<JS
+              // Written by the release pipeline: ${{ parameters.environmentName }}, build $(Build.BuildId)
+              window.__env = { apiUrl: '$(backendUrl)/api', azureMapsKey: '${MAPS_KEY}' };
+              JS
+              (cd "$WORK" && zip -q site.zip env.js)
+              cat "$WORK/env.js"
+            env:
+              MAPS_KEY: $(azureMapsKey)
+            displayName: Add environment settings (env.js) to the frontend package
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              appType: webAppLinux
+              appName: $(frontendAppName)
+              package: $(Agent.TempDirectory)/web/site.zip
+            displayName: Deploy frontend package to Azure Web App
+
+          # ---- 4. Deployment quality gate ----
+          - template: ../steps/smoke-test.yml
+            parameters:
+              name: backend is running this build
+              url: $(backendUrl)/healthz
+              expectText: '"version": "$(Build.BuildId)"'
+              attempts: 40
+          - template: ../steps/smoke-test.yml
+            parameters:
+              name: backend API returns species
+              url: $(backendUrl)/api/species/
+              expectText: Brown rat
+          - template: ../steps/smoke-test.yml
+            parameters:
+              name: frontend is served
+              url: $(frontendUrl)/
+              expectText: <app-root>
+          - template: ../steps/smoke-test.yml
+            parameters:
+              name: frontend points at this environment's API
+              url: $(frontendUrl)/env.js
+              expectText: $(backendUrl)/api
