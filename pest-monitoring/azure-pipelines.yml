@@ -31,7 +31,7 @@ parameters:
 - name: runSonarCloud
   displayName: Run SonarCloud analysis
   type: boolean
-  default: true
+  default: false # TODO: set back to true once the SonarQube Cloud extension is installed
 - name: deploy
   displayName: Push the image and deploy (develop/main only)
   type: boolean
