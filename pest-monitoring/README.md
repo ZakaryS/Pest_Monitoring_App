@@ -9,6 +9,7 @@ A crowdsourced app for reporting and monitoring rodent and bird pest activity. M
 | Database | SQLite locally and in CI, Azure SQL Database in Azure | `backend/config/settings.py` |
 | CI pipeline | Azure Pipelines | `azure-pipelines.yml` |
 | Design docs | Azure DevOps wiki (Tasks 1–9) | wiki |
+| CI/CD pipeline | Azure Pipelines + SonarCloud | `azure-pipelines.yml`, `pipelines/templates/` |
 
 More detail:
 
