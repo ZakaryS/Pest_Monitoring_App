@@ -6,3 +6,4 @@ pyjwt[crypto]>=2.9,<3            # checks Microsoft Entra ID access tokens
 pillow>=11,<13                   # checks photos and strips EXIF/GPS
 requests>=2.32,<3                # Notification Hubs REST API
 gunicorn>=23,<24                 # production web server in the container
+whitenoise>=6.7,<7               # serves static files (admin site) from gunicorn
