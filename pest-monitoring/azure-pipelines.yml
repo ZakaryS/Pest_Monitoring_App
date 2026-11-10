@@ -1,55 +1,79 @@
-# Continuous Integration for Pest Monitoring (Part 2, Task 4)
-# Runs on every push to main/develop and on every pull request into them.
-# Manual build steps mapped to automated tasks:
-#   "check my code"        -> ruff, codespell, ESLint
-#   "check the layers"     -> import-linter (architecture validation)
-#   "check code quality"   -> radon/xenon metrics, pylint duplicate-code
-#   "run the tests"        -> pytest + Karma, published as test results
-#   "how much is tested"   -> coverage, published as Cobertura
-#   "does it build"        -> ng build, docker build
+# PestPatrol CI/CD pipeline
+#   Part 2, Task 4  - CI: analysis, tests, coverage, build
+#   Part 3, Task 1  - CI: reusable templates, self-hosted agent option, SonarCloud quality gate
+#   Part 3, Task 2  - CD: ARM templates, container + zip package deployment, approvals, smoke tests
+#
+#   Build ─┬─ Backend ──────┬─ Container (docker build, smoke test, push to ACR)
+#          ├─ Frontend ─────┤
+#          ├─ Infrastructure┘
+#          └─ SonarCloud (after Backend + Frontend)
+#   Deploy_test  (develop and main)
+#   Deploy_prod  (main only, after approval on the pest-prod environment)
+#
+# Reusable steps ("custom tasks") are in pipelines/templates/. See docs/CI-CD.md.
 
 trigger:
   branches:
     include: [main, develop]
 
- 
 pr:
   branches:
     include: [main, develop]
 
+parameters:
+- name: backendAgentPool
+  displayName: Agent pool for the backend job
+  type: string
+  default: Azure Pipelines
+  values:
+  - Azure Pipelines
+  - PestPatrol-SelfHosted
+- name: runSonarCloud
+  displayName: Run SonarCloud analysis
+  type: boolean
+  default: false # TODO: set back to true once the SonarQube Cloud extension is installed
+- name: deploy
+  displayName: Push the image and deploy (develop/main only)
+  type: boolean
+  default: false
+
 variables:
-  pythonVersion: '3.12'
-  nodeVersion: '22.x'
+- group: pestpatrol             # Library: acrName, azureSubscriptionId, location, sonarOrganization,
+                                # djangoSecretKey (secret), demoAdminPassword (secret), azureMapsKey (secret)
+- name: pythonVersion
+  value: '3.12'
+- name: nodeVersion
+  value: '22.x'
+- name: azureServiceConnection
+  value: sc-pestpatrol-azure
+- name: sonarServiceConnection
+  value: sc-sonarcloud
+- name: sharedResourceGroup
+  value: rg-pestpatrol-shared
+- name: backendImageRepo
+  value: pest-backend
+- name: canPublish
+  value: $[and(ne(variables['Build.Reason'], 'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop'))]
 
 stages:
 - stage: Build
-  displayName: Build and test
+  displayName: Build, test and analyse
   jobs:
 
   # ---------------- Backend (Django) ----------------
   - job: Backend
     displayName: Backend - analysis, tests, coverage
     pool:
-      vmImage: ubuntu-latest
-    variables:
-      PIP_CACHE_DIR: $(Pipeline.Workspace)/.pip
+      ${{ if eq(parameters.backendAgentPool, 'Azure Pipelines') }}:
+        vmImage: ubuntu-latest
+      ${{ else }}:
+        name: ${{ parameters.backendAgentPool }}
     steps:
-    - task: UsePythonVersion@0
-      inputs:
-        versionSpec: $(pythonVersion)
-      displayName: Use Python $(pythonVersion)
-
-    - task: Cache@2
-      inputs:
-        key: 'pip | "$(Agent.OS)" | pest-monitoring/backend/requirements-dev.txt | pest-monitoring/backend/requirements.txt'
-        path: $(PIP_CACHE_DIR)
-      displayName: Cache pip downloads
-
-    - script: |
-        python -m pip install --upgrade pip
-        pip install -r requirements-dev.txt
-      workingDirectory: pest-monitoring/backend
-      displayName: Install dependencies
+    - template: pipelines/templates/steps/setup-python.yml
+      parameters:
+        workingDirectory: pest-monitoring/backend
+        pythonVersion: $(pythonVersion)
+        selfHosted: ${{ ne(parameters.backendAgentPool, 'Azure Pipelines') }}
 
     - script: python manage.py makemigrations --check --dry-run
       workingDirectory: pest-monitoring/backend
@@ -82,43 +106,28 @@ stages:
       workingDirectory: pest-monitoring/backend
       displayName: Dependency vulnerability scan (pip-audit)
 
-    - script: >
-        pytest
-        --junitxml=test-results.xml
-        --cov --cov-report=xml:coverage.xml --cov-report=term
+    - script: pytest --junitxml=test-results.xml --cov --cov-report=xml:coverage.xml --cov-report=term
       workingDirectory: pest-monitoring/backend
       displayName: Unit and API tests with coverage
 
-    - task: PublishTestResults@2
-      condition: succeededOrFailed()
-      inputs:
-        testResultsFormat: JUnit
-        testResultsFiles: pest-monitoring/backend/test-results.xml
-        testRunTitle: Backend tests
-        failTaskOnFailedTests: true
-      displayName: Publish backend test results
-
-    - task: PublishCodeCoverageResults@2
-      condition: succeededOrFailed()
-      inputs:
-        summaryFileLocation: pest-monitoring/backend/coverage.xml
-      displayName: Publish backend coverage
+    - template: pipelines/templates/steps/publish-results.yml
+      parameters:
+        title: Backend tests
+        testResultsFile: pest-monitoring/backend/test-results.xml
+        coverageFile: pest-monitoring/backend/coverage.xml
+        coverageArtifact: backend-coverage
+        coverageArtifactPath: pest-monitoring/backend/coverage.xml
 
   # ---------------- Frontend (Angular) ----------------
   - job: Frontend
-    displayName: Frontend - lint, tests, build
+    displayName: Frontend - lint, tests, build, package
     pool:
       vmImage: ubuntu-latest
     steps:
-    - task: NodeTool@0
-      inputs:
-        versionSpec: $(nodeVersion)
-      displayName: Use Node $(nodeVersion)
-
-    - script: |
-        if [ -f package-lock.json ]; then npm ci; else npm install; fi
-      workingDirectory: pest-monitoring/frontend
-      displayName: Install dependencies
+    - template: pipelines/templates/steps/setup-node.yml
+      parameters:
+        workingDirectory: pest-monitoring/frontend
+        nodeVersion: $(nodeVersion)
 
     - script: npm run lint
       workingDirectory: pest-monitoring/frontend
@@ -128,48 +137,151 @@ stages:
       workingDirectory: pest-monitoring/frontend
       displayName: Unit tests with coverage (Karma, headless Chrome)
 
-    - task: PublishTestResults@2
-      condition: succeededOrFailed()
-      inputs:
-        testResultsFormat: JUnit
-        testResultsFiles: pest-monitoring/frontend/test-results/junit.xml
-        testRunTitle: Frontend tests
-        failTaskOnFailedTests: true
-      displayName: Publish frontend test results
-
-    - task: PublishCodeCoverageResults@2
-      condition: succeededOrFailed()
-      inputs:
-        summaryFileLocation: pest-monitoring/frontend/coverage/cobertura-coverage.xml
-      displayName: Publish frontend coverage
-
-    - script: npm run build
-      workingDirectory: pest-monitoring/frontend
-      displayName: Production build
+    - template: pipelines/templates/steps/publish-results.yml
+      parameters:
+        title: Frontend tests
+        testResultsFile: pest-monitoring/frontend/test-results/junit.xml
+        coverageFile: pest-monitoring/frontend/coverage/cobertura-coverage.xml
+        coverageArtifact: frontend-coverage
+        coverageArtifactPath: pest-monitoring/frontend/coverage/lcov.info
 
     - script: npm audit --audit-level=high --omit=dev
       workingDirectory: pest-monitoring/frontend
       displayName: Dependency vulnerability scan (npm audit)
 
-    - publish: pest-monitoring/frontend/dist
-      artifact: frontend
-      displayName: Save built frontend
+    - script: npm run build
+      workingDirectory: pest-monitoring/frontend
+      displayName: Production build
 
-  # ---------------- Container image ----------------
-  - job: Docker
-    displayName: Backend Docker image
-    dependsOn: Backend
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    # The deployable package: built once here, deployed unchanged to test and prod
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: pest-monitoring/frontend/dist/pest-monitoring-web/browser
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/pestpatrol-web.zip
+      displayName: Create frontend deployment package (zip)
+
+    - publish: $(Build.ArtifactStagingDirectory)/pestpatrol-web.zip
+      artifact: frontend-package
+      displayName: Save frontend package
+
+  # ---------------- Infrastructure as code ----------------
+  - job: Infrastructure
+    displayName: Infrastructure - lint and compile ARM templates
     pool:
       vmImage: ubuntu-latest
     steps:
-    - script: docker build -t pest-monitoring-backend:$(Build.BuildId) -f pest-monitoring/backend/Dockerfile pest-monitoring/backend
+    - script: |
+        set -e
+        az bicep install
+        for f in shared main; do
+          az bicep lint --file infra/$f.bicep
+          az bicep build --file infra/$f.bicep --outdir "$(Build.ArtifactStagingDirectory)/infra"
+        done
+        ls -l "$(Build.ArtifactStagingDirectory)/infra"
+      workingDirectory: pest-monitoring
+      displayName: Lint Bicep and compile to ARM templates
+
+    - publish: $(Build.ArtifactStagingDirectory)/infra
+      artifact: infra
+      displayName: Save ARM templates
+
+  # ---------------- Container image ----------------
+  - job: Container
+    displayName: Backend container - build, smoke test, push
+    dependsOn: [Backend, Infrastructure]
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      localImage: $(backendImageRepo):$(Build.BuildId)
+    steps:
+    - script: >
+        docker build
+        --build-arg APP_VERSION=$(Build.BuildId)
+        -t $(localImage)
+        -f pest-monitoring/backend/Dockerfile pest-monitoring/backend
       displayName: Build image
-    # When the ACR service connection exists (Task 3), replace the step above with:
-    # - task: Docker@2
-    #   inputs:
-    #     containerRegistry: 'acr-pest-monitoring'   # service connection name
-    #     repository: 'pest-monitoring-backend'
-    #     command: buildAndPush
-    #     Dockerfile: backend/Dockerfile
-    #     tags: $(Build.BuildId)
+
+    # Run the real image the way App Service will, before it goes anywhere
+    - script: >
+        docker run -d --name smoke -p 8000:8000
+        -e DJANGO_DEBUG=false -e DJANGO_SECRET_KEY=ci-smoke-test-only -e SECURE_SSL_REDIRECT=false
+        $(localImage)
+      displayName: Start container
+
+    - template: pipelines/templates/steps/smoke-test.yml
+      parameters:
+        name: container health check
+        url: http://localhost:8000/healthz
+        expectText: '"version": "$(Build.BuildId)"'
+        attempts: 12
+        delaySeconds: 5
+    - template: pipelines/templates/steps/smoke-test.yml
+      parameters:
+        name: container API returns species
+        url: http://localhost:8000/api/species/
+        expectText: Brown rat
+        attempts: 3
+        delaySeconds: 5
+
+    - script: docker logs smoke
+      condition: always()
+      displayName: Container logs
+
+    - ${{ if parameters.deploy }}:
+      - download: current
+        artifact: infra
+        condition: and(succeeded(), eq(variables['canPublish'], 'true'))
+        displayName: Download ARM templates
+
+      - task: AzureCLI@2
+        condition: and(succeeded(), eq(variables['canPublish'], 'true'))
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -e
+            az group create --name $(sharedResourceGroup) --location $(location) --output none
+            az deployment group create --resource-group $(sharedResourceGroup) \
+              --template-file "$(Pipeline.Workspace)/infra/shared.json" \
+              --parameters acrName=$(acrName) --output none
+            az acr login --name $(acrName)
+            REMOTE=$(acrName).azurecr.io/$(backendImageRepo)
+            docker tag $(localImage) $REMOTE:$(Build.BuildId)
+            docker tag $(localImage) $REMOTE:latest
+            docker push $REMOTE:$(Build.BuildId)
+            docker push $REMOTE:latest
+        displayName: Create container registry (ARM) and push image
+
+  # ---------------- SonarCloud ----------------
+  - ${{ if parameters.runSonarCloud }}:
+    - job: SonarCloud
+      displayName: SonarCloud - analysis and quality gate
+      dependsOn: [Backend, Frontend]
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+      - checkout: self
+        fetchDepth: 0   # SonarCloud needs the full history to find new code and authors
+      - template: pipelines/templates/steps/sonarcloud.yml
+        parameters:
+          serviceConnection: $(sonarServiceConnection)
+          organization: $(sonarOrganization)
+
+# ---------------- Continuous delivery ----------------
+- ${{ if parameters.deploy }}:
+  - template: pipelines/templates/stages/deploy.yml
+    parameters:
+      environmentName: test
+      adoEnvironment: pest-test
+      dependsOn: [Build]
+      branches: [refs/heads/main, refs/heads/develop]
+
+  - template: pipelines/templates/stages/deploy.yml
+    parameters:
+      environmentName: prod
+      adoEnvironment: pest-prod
+      dependsOn: [Deploy_test]
+      branches: [refs/heads/main]
