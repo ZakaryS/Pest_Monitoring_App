@@ -9,6 +9,7 @@ DJANGO_SETTINGS_MODULE = "config.settings"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra --strict-markers"
+filterwarnings = ["ignore:No directory at:UserWarning"]
 
 [tool.coverage.run]
 source = ["domain", "reference", "accounts", "sightings", "alerts"]

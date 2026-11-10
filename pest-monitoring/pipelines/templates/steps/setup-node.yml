@@ -1,0 +1,25 @@
+# Reusable task: install Node and the exact locked npm packages.
+parameters:
+- name: workingDirectory
+  type: string
+- name: nodeVersion
+  type: string
+  default: '22.x'
+
+steps:
+- task: NodeTool@0
+  inputs:
+    versionSpec: ${{ parameters.nodeVersion }}
+  displayName: Use Node ${{ parameters.nodeVersion }}
+
+- task: Cache@2
+  inputs:
+    key: 'npm | "$(Agent.OS)" | ${{ parameters.workingDirectory }}/package-lock.json'
+    path: $(Pipeline.Workspace)/.npm
+  displayName: Cache npm downloads
+
+- script: npm ci
+  workingDirectory: ${{ parameters.workingDirectory }}
+  env:
+    npm_config_cache: $(Pipeline.Workspace)/.npm
+  displayName: Install npm dependencies

@@ -1,0 +1,36 @@
+# Reusable task: call a URL until it answers 200 (and optionally contains some text).
+# Used after "docker run" in CI and after every deployment (deployment quality gate).
+parameters:
+- name: name
+  type: string
+- name: url
+  type: string
+- name: expectText
+  type: string
+  default: ''
+- name: attempts
+  type: number
+  default: 30
+- name: delaySeconds
+  type: number
+  default: 10
+
+steps:
+- bash: |
+    for i in $(seq 1 ${{ parameters.attempts }}); do
+      code=$(curl -s -o response.txt -w '%{http_code}' --max-time 20 "$URL" || echo 000)
+      echo "Attempt $i: HTTP $code"
+      if [ "$code" = "200" ] && { [ -z "$EXPECT" ] || grep -qF "$EXPECT" response.txt; }; then
+        head -c 500 response.txt; echo
+        exit 0
+      fi
+      sleep ${{ parameters.delaySeconds }}
+    done
+    echo "##vso[task.logissue type=error]$URL did not return 200${EXPECT:+ containing '$EXPECT'}"
+    head -c 500 response.txt 2>/dev/null; echo
+    exit 1
+  workingDirectory: $(Agent.TempDirectory)
+  env:
+    URL: ${{ parameters.url }}
+    EXPECT: ${{ parameters.expectText }}
+  displayName: Smoke test - ${{ parameters.name }}

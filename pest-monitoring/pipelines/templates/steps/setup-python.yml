@@ -1,0 +1,41 @@
+# Reusable task: install Python and the project's packages into a virtual environment.
+# Works on Microsoft-hosted agents and on our self-hosted agent (which has Python already installed).
+parameters:
+- name: workingDirectory
+  type: string
+- name: requirementsFile
+  type: string
+  default: requirements-dev.txt
+- name: pythonVersion
+  type: string
+  default: '3.12'
+- name: selfHosted
+  type: boolean
+  default: false
+
+steps:
+- ${{ if not(parameters.selfHosted) }}:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: ${{ parameters.pythonVersion }}
+    displayName: Use Python ${{ parameters.pythonVersion }}
+
+- task: Cache@2
+  inputs:
+    key: 'pip | "$(Agent.OS)" | ${{ parameters.workingDirectory }}/requirements*.txt'
+    path: $(Pipeline.Workspace)/.pip
+  displayName: Cache pip downloads
+
+# A venv keeps the self-hosted agent's own Python clean; prependpath makes it the
+# default python for every later step in the job
+- script: |
+    set -e
+    PY=$(command -v python || command -v python3)
+    "$PY" -m venv "$(Agent.TempDirectory)/venv"
+    echo "##vso[task.prependpath]$(Agent.TempDirectory)/venv/bin"
+    "$(Agent.TempDirectory)/venv/bin/pip" install --upgrade pip
+    "$(Agent.TempDirectory)/venv/bin/pip" install -r ${{ parameters.requirementsFile }}
+  workingDirectory: ${{ parameters.workingDirectory }}
+  env:
+    PIP_CACHE_DIR: $(Pipeline.Workspace)/.pip
+  displayName: Install Python dependencies

@@ -1,0 +1,34 @@
+# Reusable task: publish test results and code coverage, then keep the coverage file
+# as an artifact so the SonarCloud job can read it.
+parameters:
+- name: title
+  type: string
+- name: testResultsFile
+  type: string
+- name: coverageFile
+  type: string
+- name: coverageArtifact
+  type: string
+- name: coverageArtifactPath
+  type: string
+
+steps:
+- task: PublishTestResults@2
+  condition: succeededOrFailed()
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: ${{ parameters.testResultsFile }}
+    testRunTitle: ${{ parameters.title }}
+    failTaskOnFailedTests: true
+  displayName: Publish ${{ parameters.title }} results
+
+- task: PublishCodeCoverageResults@2
+  condition: succeededOrFailed()
+  inputs:
+    summaryFileLocation: ${{ parameters.coverageFile }}
+  displayName: Publish ${{ parameters.title }} coverage
+
+- publish: ${{ parameters.coverageArtifactPath }}
+  artifact: ${{ parameters.coverageArtifact }}
+  condition: succeeded()
+  displayName: Save coverage for SonarCloud

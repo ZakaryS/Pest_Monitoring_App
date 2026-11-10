@@ -1,0 +1,54 @@
+# Reusable task: SonarCloud analysis with the coverage made by the test jobs, then wait
+# for the quality gate. sonar.qualitygate.wait=true (sonar-project.properties) fails the
+# build when the gate fails.
+parameters:
+- name: serviceConnection
+  type: string
+- name: organization
+  type: string
+- name: projectFolder
+  type: string
+  default: pest-monitoring
+
+steps:
+- download: current
+  artifact: backend-coverage
+  displayName: Download backend coverage
+- download: current
+  artifact: frontend-coverage
+  displayName: Download frontend coverage
+
+# The coverage files were made on other agents, so their file paths are rewritten
+# to point at this checkout. Without this SonarCloud shows 0% coverage.
+- bash: |
+    set -e
+    SRC="$(Build.SourcesDirectory)/${{ parameters.projectFolder }}"
+    mkdir -p "$SRC/frontend/coverage"
+    cp "$(Pipeline.Workspace)/backend-coverage/coverage.xml" "$SRC/backend/coverage.xml"
+    cp "$(Pipeline.Workspace)/frontend-coverage/lcov.info" "$SRC/frontend/coverage/lcov.info"
+    sed -i -E "s#<source>.*/${{ parameters.projectFolder }}/#<source>$SRC/#" "$SRC/backend/coverage.xml"
+    sed -i -E "s#^SF:.*/${{ parameters.projectFolder }}/frontend/#SF:$SRC/frontend/#; s#^SF:src/#SF:$SRC/frontend/src/#" \
+      "$SRC/frontend/coverage/lcov.info"
+    grep -m3 "<source>" "$SRC/backend/coverage.xml"
+    grep -m3 "^SF:" "$SRC/frontend/coverage/lcov.info"
+  displayName: Point coverage paths at this checkout
+
+- task: SonarCloudPrepare@4
+  inputs:
+    SonarCloud: ${{ parameters.serviceConnection }}
+    organization: ${{ parameters.organization }}
+    scannerMode: cli
+    configMode: file
+    configFile: sonar-project.properties
+  displayName: Prepare SonarCloud analysis
+
+- task: SonarCloudAnalyze@4
+  inputs:
+    jdkversion: JAVA_HOME_21_X64
+  displayName: Run SonarCloud analysis
+
+- task: SonarCloudPublish@4
+  condition: succeededOrFailed()
+  inputs:
+    pollingTimeoutSec: '300'
+  displayName: Publish quality gate result
