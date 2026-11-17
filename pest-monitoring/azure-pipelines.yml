@@ -1,14 +1,13 @@
 # PestPatrol CI/CD pipeline
 #   Part 2, Task 4  - CI: analysis, tests, coverage, build
 #   Part 3, Task 1  - CI: reusable templates, self-hosted agent option, SonarCloud quality gate
-#   Part 3, Task 2  - CD: ARM templates, container + zip package deployment, approvals, smoke tests
+#   Part 3, Task 2  - CD: deploy the tested commit to Render, approval on pest-prod, smoke tests
 #
-#   Build ─┬─ Backend ──────┬─ Container (docker build, smoke test, push to ACR)
+#   Build ─┬─ Backend ──────┬─ Container (docker build + smoke test of the real image)
 #          ├─ Frontend ─────┤
 #          ├─ Infrastructure┘
 #          └─ SonarCloud (after Backend + Frontend)
-#   Deploy_test  (develop and main)
-#   Deploy_prod  (main only, after approval on the pest-prod environment)
+#   Deploy  (main only, after approval on the pest-prod environment)
 #
 # Reusable steps ("custom tasks") are in pipelines/templates/. See docs/CI-CD.md.
 
@@ -31,29 +30,22 @@ parameters:
 - name: runSonarCloud
   displayName: Run SonarCloud analysis
   type: boolean
-  default: true # TODO: set back to true once the SonarQube Cloud extension is installed
+  default: true
 - name: deploy
-  displayName: Push the image and deploy (develop/main only)
+  displayName: Deploy to Render (main only)
   type: boolean
-  default: false
+  default: true
 
 variables:
-- group: pestpatrol             # Library: acrName, azureSubscriptionId, location, sonarOrganization,
-                                # djangoSecretKey (secret), demoAdminPassword (secret)
+# Pipeline variables (Edit -> Variables): sonarToken, renderBackendDeployHook, renderFrontendDeployHook
+# (all secret), backendUrl, frontendUrl. See docs/CI-CD.md.
+- group: pestpatrol
 - name: pythonVersion
   value: '3.12'
 - name: nodeVersion
   value: '22.x'
-- name: azureServiceConnection
-  value: sc-pestpatrol-azure
-- name: sonarServiceConnection
-  value: sc-sonarcloud
-- name: sharedResourceGroup
-  value: rg-pestpatrol-shared
 - name: backendImageRepo
   value: pest-backend
-- name: canPublish
-  value: $[and(ne(variables['Build.Reason'], 'PullRequest'), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop'))]
 
 stages:
 - stage: Build
@@ -189,7 +181,7 @@ stages:
 
   # ---------------- Container image ----------------
   - job: Container
-    displayName: Backend container - build, smoke test, push
+    displayName: Backend container - build and smoke test
     dependsOn: [Backend, Infrastructure]
     pool:
       vmImage: ubuntu-latest
@@ -203,7 +195,7 @@ stages:
         -f pest-monitoring/backend/Dockerfile pest-monitoring/backend
       displayName: Build image
 
-    # Run the real image the way App Service will, before it goes anywhere
+    # Run the real image the way Render will, before anything is deployed
     - script: >
         docker run -d --name smoke -p 8000:8000
         -e DJANGO_DEBUG=false -e DJANGO_SECRET_KEY=ci-smoke-test-only -e SECURE_SSL_REDIRECT=false
@@ -229,32 +221,6 @@ stages:
       condition: always()
       displayName: Container logs
 
-    - ${{ if parameters.deploy }}:
-      - download: current
-        artifact: infra
-        condition: and(succeeded(), eq(variables['canPublish'], 'true'))
-        displayName: Download ARM templates
-
-      - task: AzureCLI@2
-        condition: and(succeeded(), eq(variables['canPublish'], 'true'))
-        inputs:
-          azureSubscription: $(azureServiceConnection)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -e
-            az group create --name $(sharedResourceGroup) --location $(location) --output none
-            az deployment group create --resource-group $(sharedResourceGroup) \
-              --template-file "$(Pipeline.Workspace)/infra/shared.json" \
-              --parameters acrName=$(acrName) --output none
-            az acr login --name $(acrName)
-            REMOTE=$(acrName).azurecr.io/$(backendImageRepo)
-            docker tag $(localImage) $REMOTE:$(Build.BuildId)
-            docker tag $(localImage) $REMOTE:latest
-            docker push $REMOTE:$(Build.BuildId)
-            docker push $REMOTE:latest
-        displayName: Create container registry (ARM) and push image
-
   # ---------------- SonarCloud ----------------
   - ${{ if parameters.runSonarCloud }}:
     - job: SonarCloud
@@ -268,17 +234,9 @@ stages:
       - template: pipelines/templates/steps/sonarcloud.yml
 
 # ---------------- Continuous delivery ----------------
+# Merges to main deploy the commit CI just tested to Render, after approval on pest-prod.
 - ${{ if parameters.deploy }}:
   - template: pipelines/templates/stages/deploy.yml
     parameters:
-      environmentName: test
-      adoEnvironment: pest-test
-      dependsOn: [Build]
-      branches: [refs/heads/main, refs/heads/develop]
-
-  - template: pipelines/templates/stages/deploy.yml
-    parameters:
-      environmentName: prod
       adoEnvironment: pest-prod
-      dependsOn: [Deploy_test]
-      branches: [refs/heads/main]
+      dependsOn: [Build]

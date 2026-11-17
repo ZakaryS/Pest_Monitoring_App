@@ -1,37 +1,26 @@
-# Reusable release stage (Part 3, Task 2). The pipeline uses it once for "test" and once
-# for "prod", so both environments are deployed by exactly the same steps.
+# Release stage (Part 3, Task 2): deploy the exact commit CI just built and tested to Render,
+# then smoke-test it. Runs only for main (never for pull requests), and only after someone
+# approves it on the pest-prod environment (Pipelines -> Environments -> pest-prod).
 #
-#   1. Create/update the Azure resources from the ARM template (compiled from infra/main.bicep)
-#   2. Point the backend Web App at the container image built in CI
-#   3. Add env.js to the frontend package and deploy it to the frontend Web App
-#   4. Smoke tests: the deployment fails if the new version isn't answering
+#   1. Trigger the Render deploy hooks for the backend (Docker) and frontend (static site)
+#   2. Smoke tests: the stage fails unless the new commit is the one answering
 parameters:
-- name: environmentName        # test | prod
-  type: string
 - name: adoEnvironment         # Azure DevOps environment (approvals are set on it)
   type: string
 - name: dependsOn
   type: object
-- name: branches               # branches allowed to deploy to this environment
-  type: object
-- name: appServiceSku
-  type: string
-  default: B1
 
 stages:
-- stage: Deploy_${{ parameters.environmentName }}
-  displayName: Deploy to ${{ parameters.environmentName }}
+- stage: Deploy
+  displayName: Deploy to Render
   dependsOn: ${{ parameters.dependsOn }}
   condition: >-
     and(succeeded(),
         ne(variables['Build.Reason'], 'PullRequest'),
-        containsValue(split('${{ join(',', parameters.branches) }}', ','), variables['Build.SourceBranch']))
-  variables:
-    resourceGroup: rg-pestpatrol-${{ parameters.environmentName }}
-    backendImage: $(acrName).azurecr.io/$(backendImageRepo):$(Build.BuildId)
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
   - deployment: Deploy
-    displayName: Deploy PestPatrol (${{ parameters.environmentName }})
+    displayName: Deploy PestPatrol
     environment: ${{ parameters.adoEnvironment }}
     pool:
       vmImage: ubuntu-latest
@@ -39,91 +28,50 @@ stages:
       runOnce:
         deploy:
           steps:
-          - download: current
-            artifact: infra
-            displayName: Download ARM templates
-          - download: current
-            artifact: frontend-package
-            displayName: Download frontend package
+          - download: none   # Render builds from Git itself, so no build artifacts are needed here
 
-          # ---- 1 + 2. Infrastructure as code (also sets the backend image) ----
-          - task: AzureResourceManagerTemplateDeployment@3
-            inputs:
-              deploymentScope: Resource Group
-              azureResourceManagerConnection: $(azureServiceConnection)
-              subscriptionId: $(azureSubscriptionId)
-              action: Create Or Update Resource Group
-              resourceGroupName: $(resourceGroup)
-              location: $(location)
-              templateLocation: Linked artifact
-              csmFile: $(Pipeline.Workspace)/infra/main.json
-              overrideParameters: >-
-                -environmentName ${{ parameters.environmentName }}
-                -acrName $(acrName)
-                -sharedResourceGroup $(sharedResourceGroup)
-                -backendImage $(backendImage)
-                -appVersion $(Build.BuildId)
-                -appServiceSku ${{ parameters.appServiceSku }}
-                -djangoSecretKey $(djangoSecretKey)
-                -demoAdminPassword $(demoAdminPassword)
-              deploymentMode: Incremental
-              deploymentName: pestpatrol-$(Build.BuildId)
-              deploymentOutputs: armOutputs
-            displayName: Deploy ARM template (App Service, Application Insights)
-
-          # Turn the template outputs (app names and URLs) into pipeline variables
+          # Deploy hooks are secret URLs, so they come in through env (secrets are never exposed automatically).
+          # ref= makes Render deploy exactly the commit this pipeline tested, not whatever is newest on main.
           - bash: |
-              set -euo pipefail
-              for key in backendAppName frontendAppName backendUrl frontendUrl; do
-                value=$(echo "$ARM_OUTPUTS" | jq -r ".${key}.value")
-                echo "$key = $value"
-                echo "##vso[task.setvariable variable=${key}]${value}"
+              set -e
+              for hook in "$BACKEND_HOOK" "$FRONTEND_HOOK"; do
+                case "$hook" in
+                  ''|'$('*) echo "##vso[task.logissue type=error]renderBackendDeployHook / renderFrontendDeployHook pipeline variables are missing"; exit 1 ;;
+                esac
               done
+              curl -fsS -X POST "$BACKEND_HOOK&ref=$(Build.SourceVersion)"; echo
+              curl -fsS -X POST "$FRONTEND_HOOK&ref=$(Build.SourceVersion)"; echo
+            displayName: Trigger Render deploys for commit $(Build.SourceVersion)
             env:
-              ARM_OUTPUTS: $(armOutputs)
-            displayName: Read ARM template outputs
+              BACKEND_HOOK: $(renderBackendDeployHook)
+              FRONTEND_HOOK: $(renderFrontendDeployHook)
 
-          # ---- 3. Frontend package (zip deploy, the Linux equivalent of a Web Deploy package) ----
-          - bash: |
-              set -euo pipefail
-              WORK="$(Agent.TempDirectory)/web"
-              mkdir -p "$WORK"
-              cp "$(Pipeline.Workspace)/frontend-package/pestpatrol-web.zip" "$WORK/site.zip"
-              cat > "$WORK/env.js" <<JS
-              // Written by the release pipeline: ${{ parameters.environmentName }}, build $(Build.BuildId)
-              window.__env = { apiUrl: '$(backendUrl)/api' };
-              JS
-              (cd "$WORK" && zip -q site.zip env.js)
-              cat "$WORK/env.js"
-            displayName: Add environment settings (env.js) to the frontend package
-
-          - task: AzureWebApp@1
-            inputs:
-              azureSubscription: $(azureServiceConnection)
-              appType: webAppLinux
-              appName: $(frontendAppName)
-              package: $(Agent.TempDirectory)/web/site.zip
-            displayName: Deploy frontend package to Azure Web App
-
-          # ---- 4. Deployment quality gate ----
+          # The free plan builds the image from scratch, so allow up to 15 minutes
           - template: ../steps/smoke-test.yml
             parameters:
-              name: backend is running this build
+              name: backend is running this commit
               url: $(backendUrl)/healthz
-              expectText: '"version": "$(Build.BuildId)"'
-              attempts: 40
+              expectText: $(Build.SourceVersion)
+              attempts: 60
+              delaySeconds: 15
           - template: ../steps/smoke-test.yml
             parameters:
-              name: backend API returns species
+              name: API returns seeded species
               url: $(backendUrl)/api/species/
-              expectText: Brown rat
+              expectText: common_name
+              attempts: 5
+              delaySeconds: 10
           - template: ../steps/smoke-test.yml
             parameters:
               name: frontend is served
               url: $(frontendUrl)/
-              expectText: <app-root>
+              expectText: <app-root
+              attempts: 40
+              delaySeconds: 15
           - template: ../steps/smoke-test.yml
             parameters:
-              name: frontend points at this environment's API
+              name: frontend points at the backend
               url: $(frontendUrl)/env.js
               expectText: $(backendUrl)/api
+              attempts: 5
+              delaySeconds: 10
